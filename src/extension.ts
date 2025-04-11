@@ -3,11 +3,41 @@
 import * as vscode from 'vscode';
 import OpenAI from 'openai';
 import axios from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+// 读取配置文件
+function loadConfig() {
+	try {
+		const configPath = path.join(os.homedir(), '.codefixrc.json');
+		if (fs.existsSync(configPath)) {
+			const configContent = fs.readFileSync(configPath, 'utf8');
+			return JSON.parse(configContent);
+		}
+	} catch (error) {
+		console.error('Error loading config:', error);
+	}
+	return null;
+}
+
+// 从AI响应中提取代码
+function extractCodeFromResponse(response: string): string {
+	// 支持多种代码块格式
+	const codeBlockRegex = /```(?:typescript|javascript|ts|js)?\n([\s\S]*?)```/;
+	const match = response.match(codeBlockRegex);
+	if (match && match[1]) {
+		return match[1].trim();
+	}
+	// 如果没有代码块标记，尝试直接返回清理后的响应
+	return response.trim();
+}
 
 // 配置OpenAI客户端
+const config = loadConfig();
 const openai = new OpenAI({
-	baseURL: process.env.OPENAI_API_BASE || 'https://api.openai.com/v1',
-	apiKey: process.env.OPENAI_API_KEY,
+	baseURL: config?.openai?.apiBase || process.env.OPENAI_API_BASE || 'https://api.openai.com/v1',
+	apiKey: config?.openai?.apiKey || process.env.OPENAI_API_KEY,
 	defaultHeaders: {
 		'Content-Type': 'application/json',
 	},
@@ -19,8 +49,8 @@ async function getDiagnostics(document: vscode.TextDocument): Promise<vscode.Dia
 	return diagnostics;
 }
 
-// 使用AI修复代码
-async function fixCodeWithAI(code: string, errors: vscode.Diagnostic[]): Promise<string> {
+// 构建修复代码的提示词
+function buildFixPrompt(code: string, errors: vscode.Diagnostic[], filePath: string): string {
 	const errorMessages = errors.map(error => ({
 		message: error.message,
 		range: {
@@ -29,23 +59,29 @@ async function fixCodeWithAI(code: string, errors: vscode.Diagnostic[]): Promise
 		}
 	}));
 
-	const prompt = `Please fix the following TypeScript/JavaScript code. Here are the errors:
-${JSON.stringify(errorMessages, null, 2)}
+	return `Fix any issues in the following code from file path ${filePath}:
 
-Code to fix:
+${errorMessages.map(err => `Error: ${err.message} at line ${err.range.start.line + 1}`).join('\n')}
+
 \`\`\`typescript
 ${code}
 \`\`\`
 
-Please provide only the fixed code without any explanations.`;
+
+Return the fixed code wrapped in a code block with the language specified (typescript or javascript).`;
+}
+
+// 使用AI修复代码
+async function fixCodeWithAI(code: string, errors: vscode.Diagnostic[], filePath: string): Promise<string> {
+	const prompt = buildFixPrompt(code, errors, filePath);
 
 	try {
 		const completion = await openai.chat.completions.create({
-			model: "gpt-4-turbo-preview",
+			model: config?.openai?.model || "gpt-4-turbo-preview",
 			messages: [
 				{
 					role: "system",
-					content: "You are a TypeScript/JavaScript expert. Fix the code according to the errors. Return only the fixed code."
+					content: "You are a TypeScript/JavaScript expert. Fix the code according to the errors. Return only the fixed code wrapped in a code block."
 				},
 				{
 					role: "user",
@@ -53,16 +89,29 @@ Please provide only the fixed code without any explanations.`;
 				}
 			],
 			temperature: 0.2,
+			stream: true,
 		});
 
-		return completion.choices[0].message.content || code;
+		let fullResponse = '';
+		for await (const chunk of completion) {
+			const content = chunk.choices[0]?.delta?.content || '';
+			fullResponse += content;
+		}
+
+		const fixedCode = extractCodeFromResponse(fullResponse);
+		if (!fixedCode) {
+			throw new Error('Failed to extract code from AI response');
+		}
+
+		return fixedCode;
 	} catch (error: unknown) {
 		if (error instanceof Error) {
 			console.error('Error calling OpenAI:', error.message);
+			throw new Error(`Failed to get AI response: ${error.message}`);
 		} else {
 			console.error('Error calling OpenAI:', error);
+			throw new Error('Failed to get AI response: Unknown error');
 		}
-		throw new Error('Failed to get AI response');
 	}
 }
 
@@ -83,21 +132,36 @@ async function fixCurrentFile() {
 	}
 
 	try {
-		vscode.window.showInformationMessage('Fixing errors with AI...');
-		const fixedCode = await fixCodeWithAI(document.getText(), diagnostics);
-		
-		await editor.edit((editBuilder: vscode.TextEditorEdit) => {
-			const fullRange = new vscode.Range(
-				document.positionAt(0),
-				document.positionAt(document.getText().length)
+		const progressOptions = {
+			location: vscode.ProgressLocation.Notification,
+			title: "Fixing code with AI...",
+			cancellable: false
+		};
+
+		await vscode.window.withProgress(progressOptions, async (progress) => {
+			progress.report({ increment: 0 });
+			
+			const fixedCode = await fixCodeWithAI(
+				document.getText(),
+				diagnostics,
+				document.fileName
 			);
-			editBuilder.replace(fullRange, fixedCode);
+			
+			progress.report({ increment: 100 });
+
+			await editor.edit((editBuilder: vscode.TextEditorEdit) => {
+				const fullRange = new vscode.Range(
+					document.positionAt(0),
+					document.positionAt(document.getText().length)
+				);
+				editBuilder.replace(fullRange, fixedCode);
+			});
 		});
 
 		vscode.window.showInformationMessage('Code fixed successfully!');
 	} catch (error: unknown) {
 		if (error instanceof Error) {
-			vscode.window.showErrorMessage('Failed to fix code: ' + error.message);
+			vscode.window.showErrorMessage(`Failed to fix code: ${error.message}`);
 		} else {
 			vscode.window.showErrorMessage('Failed to fix code: Unknown error');
 		}
@@ -124,7 +188,7 @@ async function fixAllFiles() {
 
 		if (diagnostics.length > 0) {
 			try {
-				const fixedCode = await fixCodeWithAI(document.getText(), diagnostics);
+				const fixedCode = await fixCodeWithAI(document.getText(), diagnostics, file.fsPath);
 				const editor = await vscode.window.showTextDocument(document);
 				
 				await editor.edit((editBuilder: vscode.TextEditorEdit) => {
@@ -154,13 +218,13 @@ async function fixAllFiles() {
 export function activate(context: vscode.ExtensionContext) {
 	// Use the console to output diagnostic information (console.log) and errors (console.error)
 	// This line of code will only be executed once when your extension is activated
-	console.log('Extension "vscode-ai-fixer" is now active!');
+	console.log('Extension "BitCodeFixer" is now active!');
 
 	// The command has been defined in the package.json file
 	// Now provide the implementation of the command with registerCommand
 	// The commandId parameter must match the command field in package.json
-	let fixCurrentFileDisposable = vscode.commands.registerCommand('vscode-ai-fixer.fixCurrentFile', fixCurrentFile);
-	let fixAllErrorsDisposable = vscode.commands.registerCommand('vscode-ai-fixer.fixAllErrors', fixAllFiles);
+	let fixCurrentFileDisposable = vscode.commands.registerCommand('bitcodefixer.fixCurrentFile', fixCurrentFile);
+	let fixAllErrorsDisposable = vscode.commands.registerCommand('bitcodefixer.fixAllErrors', fixAllFiles);
 
 	context.subscriptions.push(fixCurrentFileDisposable, fixAllErrorsDisposable);
 }
