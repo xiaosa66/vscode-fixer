@@ -220,16 +220,57 @@ async function fixAllFiles() {
 // 获取git暂存区的变更
 async function getStagedChanges(): Promise<string> {
 	try {
-		const { stdout } = await execAsync('git diff --cached');
+		// 获取当前工作区路径
+		const workspaceFolders = vscode.workspace.workspaceFolders;
+		if (!workspaceFolders || workspaceFolders.length === 0) {
+			throw new Error('没有打开的工作区');
+		}
+		const workspacePath = workspaceFolders[0].uri.fsPath;
+
+		// 首先检查是否在git仓库中
+		try {
+			await execAsync('git rev-parse --git-dir', { cwd: workspacePath });
+		} catch (error) {
+			throw new Error(`当前目录不是一个git仓库\n当前工作目录: ${workspacePath}`);
+		}
+
+		// 检查是否有暂存的更改
+		const { stdout: status } = await execAsync('git status --porcelain', { cwd: workspacePath });
+		if (!status) {
+			throw new Error('没有暂存的更改');
+		}
+
+		// 检查是否有暂存的文件
+		const { stdout: stagedFiles } = await execAsync('git diff --cached --name-only', { cwd: workspacePath });
+		if (!stagedFiles) {
+			throw new Error('没有暂存的文件');
+		}
+
+		// 获取暂存区的变更
+		const { stdout } = await execAsync('git diff --cached', { cwd: workspacePath });
+		if (!stdout) {
+			// 如果没有 diff 输出，可能是新文件
+			const { stdout: newFiles } = await execAsync('git ls-files --stage --others --exclude-standard', { cwd: workspacePath });
+			if (newFiles) {
+				return `新文件:\n${newFiles.split('\n').join('\n')}`;
+			}
+			throw new Error('无法获取暂存区的更改内容');
+		}
+
 		return stdout;
 	} catch (error) {
-		throw new Error('Failed to get staged changes');
+		if (error instanceof Error) {
+			throw new Error(`获取暂存区更改失败: ${error.message}`);
+		}
+		throw new Error('获取暂存区更改失败: 未知错误');
 	}
 }
 
 // 使用AI生成commit消息
 async function generateCommitMessage(changes: string): Promise<string> {
 	try {
+		console.log('开始生成commit消息，变更内容:', changes);
+
 		const completion = await openai.chat.completions.create({
 			model: config?.openai?.model || "gpt-4-turbo-preview",
 			messages: [
@@ -245,21 +286,39 @@ async function generateCommitMessage(changes: string): Promise<string> {
 			temperature: 0.2,
 		});
 
-		return completion.choices[0]?.message?.content || '';
+		const message = completion.choices[0]?.message?.content;
+		if (!message) {
+			console.error('AI返回的消息为空');
+			throw new Error('AI返回的消息为空');
+		}
+
+		console.log('生成的commit消息:', message);
+		return message;
 	} catch (error) {
-		throw new Error('Failed to generate commit message');
+		console.error('生成commit消息时出错:', error);
+		if (error instanceof Error) {
+			throw new Error(`生成commit消息失败: ${error.message}`);
+		}
+		throw new Error('生成commit消息失败: 未知错误');
 	}
 }
 
 // 执行git commit
 async function executeGitCommit(message: string): Promise<void> {
 	try {
+		// 获取当前工作区路径
+		const workspaceFolders = vscode.workspace.workspaceFolders;
+		if (!workspaceFolders || workspaceFolders.length === 0) {
+			throw new Error('没有打开的工作区');
+		}
+		const workspacePath = workspaceFolders[0].uri.fsPath;
+
 		// 创建临时文件来存储commit消息
 		const tempFile = path.join(os.tmpdir(), 'commit-message.txt');
 		fs.writeFileSync(tempFile, message);
 
 		// 使用vim编辑commit消息
-		await execAsync(`git commit -F "${tempFile}" --edit`);
+		await execAsync(`git commit -F "${tempFile}" --edit`, { cwd: workspacePath });
 
 		// 清理临时文件
 		fs.unlinkSync(tempFile);
@@ -273,7 +332,7 @@ async function aiCommit() {
 	try {
 		const progressOptions = {
 			location: vscode.ProgressLocation.Notification,
-			title: "Generating commit message...",
+			title: "正在生成commit消息...",
 			cancellable: false
 		};
 
@@ -282,11 +341,7 @@ async function aiCommit() {
 			
 			// 获取暂存区的变更
 			const changes = await getStagedChanges();
-			if (!changes) {
-				vscode.window.showInformationMessage('No changes staged for commit');
-				return;
-			}
-
+			
 			// 生成commit消息
 			const commitMessage = await generateCommitMessage(changes);
 			
@@ -296,12 +351,12 @@ async function aiCommit() {
 			await executeGitCommit(commitMessage);
 		});
 
-		vscode.window.showInformationMessage('Commit created successfully!');
+		vscode.window.showInformationMessage('Commit创建成功！');
 	} catch (error: unknown) {
 		if (error instanceof Error) {
-			vscode.window.showErrorMessage(`Failed to create commit: ${error.message}`);
+			vscode.window.showErrorMessage(error.message);
 		} else {
-			vscode.window.showErrorMessage('Failed to create commit: Unknown error');
+			vscode.window.showErrorMessage('创建commit失败: 未知错误');
 		}
 	}
 }
