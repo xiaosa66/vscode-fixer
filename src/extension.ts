@@ -6,6 +6,10 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 // 读取配置文件
 function loadConfig() {
@@ -213,6 +217,95 @@ async function fixAllFiles() {
 	vscode.window.showInformationMessage(`Fixed ${fixedCount} files successfully!`);
 }
 
+// 获取git暂存区的变更
+async function getStagedChanges(): Promise<string> {
+	try {
+		const { stdout } = await execAsync('git diff --cached');
+		return stdout;
+	} catch (error) {
+		throw new Error('Failed to get staged changes');
+	}
+}
+
+// 使用AI生成commit消息
+async function generateCommitMessage(changes: string): Promise<string> {
+	try {
+		const completion = await openai.chat.completions.create({
+			model: config?.openai?.model || "gpt-4-turbo-preview",
+			messages: [
+				{
+					role: "system",
+					content: "You are a git commit message expert. Generate a concise and descriptive commit message based on the changes. Follow conventional commit format."
+				},
+				{
+					role: "user",
+					content: `Generate a commit message for these changes:\n\n${changes}`
+				}
+			],
+			temperature: 0.2,
+		});
+
+		return completion.choices[0]?.message?.content || '';
+	} catch (error) {
+		throw new Error('Failed to generate commit message');
+	}
+}
+
+// 执行git commit
+async function executeGitCommit(message: string): Promise<void> {
+	try {
+		// 创建临时文件来存储commit消息
+		const tempFile = path.join(os.tmpdir(), 'commit-message.txt');
+		fs.writeFileSync(tempFile, message);
+
+		// 使用vim编辑commit消息
+		await execAsync(`git commit -F "${tempFile}" --edit`);
+
+		// 清理临时文件
+		fs.unlinkSync(tempFile);
+	} catch (error) {
+		throw new Error('Failed to execute git commit');
+	}
+}
+
+// AI Commit命令实现
+async function aiCommit() {
+	try {
+		const progressOptions = {
+			location: vscode.ProgressLocation.Notification,
+			title: "Generating commit message...",
+			cancellable: false
+		};
+
+		await vscode.window.withProgress(progressOptions, async (progress) => {
+			progress.report({ increment: 0 });
+			
+			// 获取暂存区的变更
+			const changes = await getStagedChanges();
+			if (!changes) {
+				vscode.window.showInformationMessage('No changes staged for commit');
+				return;
+			}
+
+			// 生成commit消息
+			const commitMessage = await generateCommitMessage(changes);
+			
+			progress.report({ increment: 100 });
+
+			// 执行commit
+			await executeGitCommit(commitMessage);
+		});
+
+		vscode.window.showInformationMessage('Commit created successfully!');
+	} catch (error: unknown) {
+		if (error instanceof Error) {
+			vscode.window.showErrorMessage(`Failed to create commit: ${error.message}`);
+		} else {
+			vscode.window.showErrorMessage('Failed to create commit: Unknown error');
+		}
+	}
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
@@ -225,8 +318,9 @@ export function activate(context: vscode.ExtensionContext) {
 	// The commandId parameter must match the command field in package.json
 	let fixCurrentFileDisposable = vscode.commands.registerCommand('bitcodefixer.fixCurrentFile', fixCurrentFile);
 	let fixAllErrorsDisposable = vscode.commands.registerCommand('bitcodefixer.fixAllErrors', fixAllFiles);
+	let aiCommitDisposable = vscode.commands.registerCommand('bitcodefixer.aiCommit', aiCommit);
 
-	context.subscriptions.push(fixCurrentFileDisposable, fixAllErrorsDisposable);
+	context.subscriptions.push(fixCurrentFileDisposable, fixAllErrorsDisposable, aiCommitDisposable);
 }
 
 // This method is called when your extension is deactivated

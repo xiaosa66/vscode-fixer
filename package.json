@@ -48,6 +48,10 @@
       {
         "command": "bitcodefixer.fixCurrentFile",
         "title": "BitCodeFixer: Fix Current File Errors"
+      },
+      {
+        "command": "bitcodefixer.aiCommit",
+        "title": "BitCodeFixer: AI Commit Message"
       }
     ],
     "keybindings": [
